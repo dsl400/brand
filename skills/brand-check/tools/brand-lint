@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""brand-lint — find the values in code that the brand tokens do not hold.
+
+Usage: brand-lint [<path> ...] --workspace <dir> [--json]
+
+Reads <workspace>/docs/brand/tokens.json. With no path, scans the workspace.
+In a git repository, scans the tracked and untracked files that .gitignore
+does not exclude. Reports one finding per line: path:line:col — RULE — message
+
+Exit status: 0 with no finding, 1 with a finding, 2 when tokens.json is absent
+or invalid, or a path lies outside the workspace. A line that holds the text
+"brand-lint: allow" is skipped.
+
+Rules:
+  BL-COLOR   a hex, rgb(), hsl(), or named color outside the palette
+  BL-FONT    a font family outside the typography: CSS, the font shorthand,
+             SVG attributes, fontFamily in JS, Google Fonts URLs, font-[...]
+  BL-RADIUS  a corner radius other than corner_radius_px: CSS, borderRadius
+             in JS, rounded-[...]
+  BL-NAME    the ASCII form of the name, in any letter case
+
+Out of reach (brand-check reviews these by reading): oklch(), lab(),
+color-mix(), named Tailwind classes such as rounded-lg or text-blue-500,
+values built at runtime, and binary files (PNG, PDF, Office).
+"""
+import argparse
+import colorsys
+import json
+import re
+import subprocess
+import sys
+from bisect import bisect_right
+from pathlib import Path
+
+TOKENS = "docs/brand/tokens.json"
+ALLOW_MARK = "brand-lint: allow"
+
+# The file types that hold colors, fonts, or visible text.
+EXTENSIONS = {
+    ".css", ".scss", ".sass", ".less", ".html", ".htm", ".svg", ".js", ".jsx",
+    ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".astro", ".md", ".mdx",
+    ".json", ".yml", ".yaml", ".txt",
+}
+
+# In these files each hex literal outside an id or a link is a color. In the
+# other files a hex is a color only after a color key on the same line,
+# because "#123" there is often an issue, an anchor, or an id.
+STYLE_EXT = {".css", ".scss", ".sass", ".less", ".html", ".htm", ".svg",
+             ".vue", ".svelte", ".astro"}
+
+# A folder with one of these names holds code that the project does not
+# write, at any depth, so a monorepo scans only its own sources.
+SKIP_DIRS = {".git", "node_modules", "dist", "build", ".next", ".nuxt", "out",
+             "coverage", "vendor", ".venv", "venv", "__pycache__", ".turbo",
+             ".svelte-kit", ".astro"}
+
+# docs/brand/ is the source of the tokens, so it agrees by construction.
+# reports/ holds the findings, which quote the deviations.
+SKIP_ROOT = ("docs/brand/", "reports/")
+SKIP_FILES = re.compile(r"(\.min\.\w+|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$")
+
+# A generic family or a CSS-wide keyword names no typeface.
+GENERIC_FONTS = {
+    "serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui",
+    "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded", "math",
+    "emoji", "fangsong", "inherit", "initial", "unset", "revert",
+    "revert-layer", "-apple-system", "blinkmacsystemfont",
+}
+CSS_WIDE = {"inherit", "initial", "unset", "revert", "revert-layer"}
+DYNAMIC = re.compile(r"var\(|\$\{|\$\w|theme\(|calc\(|clamp\(|min\(|max\(|env\(")
+
+NAMED_COLORS = set("""
+aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond
+blue blueviolet brown burlywood cadetblue chartreuse chocolate coral
+cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray
+darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid
+darkred darksalmon darkseagreen darkslateblue darkslategray darkslategrey
+darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue
+firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold goldenrod
+gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki
+lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan
+lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon
+lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue
+lightyellow lime limegreen linen magenta maroon mediumaquamarine mediumblue
+mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen
+mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin
+navajowhite navy oldlace olive olivedrab orange orangered orchid palegoldenrod
+palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum
+powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon
+sandybrown seagreen seashell sienna silver skyblue slateblue slategray
+slategrey snow springgreen steelblue tan teal thistle tomato turquoise violet
+wheat white whitesmoke yellow yellowgreen
+""".split())
+NAMED_HEX = {"white": "#FFFFFF", "black": "#000000"}
+
+HEX = re.compile(r"(?<![\w&#])#([0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3,4})(?![\w-])")
+RGB = re.compile(r"\brgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})(?:[\s,/]+[\d.]+%?)?\s*\)")
+HSL = re.compile(r"\bhsla?\(\s*([\d.]+)(?:deg)?[\s,]+([\d.]+)%[\s,]+([\d.]+)%(?:[\s,/]+[\d.]+%?)?\s*\)")
+# A hex after one of these is an id, an anchor, or a link.
+NOT_COLOR = re.compile(
+    r"""(?:\b(?:href|id|src|for|name|to|action|xlink:href|data-[\w-]+)\s*=\s*["']?[^"'\s>]*"""
+    r"""|\burl\(\s*["']?[^)"']*|\?[^\s"'<>]*|(?:querySelector(?:All)?|getElementById|closest|matches)\(\s*["'`][^"'`]*)$""")
+# An id selector such as "#fade {" reaches a brace before a semicolon.
+SELECTOR = re.compile(r"[^;{}\"'<>]*\{")
+COLOR_KEY = re.compile(r"colou?r|fill|stroke|background|\bbg\b|\bfg\b|border|accent|palette|"
+                       r"primary|secondary|brand|theme|\btext\b|shadow|outline|-\[$", re.I)
+NAMED_DECL = re.compile(
+    r"""(?:(?<![\w-])(?:color|background(?:-color)?|fill|stroke|border(?:-[a-z]+)*-color|outline-color|"""
+    r"""stop-color|caret-color|accent-color)\s*:\s*|\b(?:fill|stroke|color|stop-color)\s*=\s*["'])([a-zA-Z]+)\b""")
+
+FONT_CSS = re.compile(r"(?<![\w-])font-family\s*:\s*")
+FONT_SHORT = re.compile(r"(?<![\w-])font\s*:\s*[^;{}\"']*?\d[\w.%]*(?:\s*/\s*[\d.]+\w*)?\s+(?=['\"A-Za-z-])")
+FONT_ATTR = re.compile(r"""(?<![\w-])font-family\s*=\s*(["'])(.*?)\1""")
+FONT_JS = re.compile(r"\bfontFamily\s*[:=]\s*")
+FONT_GOOGLE = re.compile(r"fonts\.googleapis\.com/css2?\?([^\"'\s)>]+)")
+FONT_TW = re.compile(r"(?<![\w-])font-\[([^\]\s]+)\]")
+RADIUS_CSS = re.compile(r"(?<![\w-])border-(?:(?:top|bottom)-(?:left|right)-|(?:start|end)-(?:start|end)-)?radius\s*:\s*([^;{}\"'\n]+)")
+RADIUS_JS = re.compile(r"\bborder(?:(?:Top|Bottom)(?:Left|Right)|(?:Start|End)(?:Start|End))?Radius\s*[:=]\s*")
+RADIUS_TW = re.compile(r"(?<![\w-])rounded(?:-[a-z]{1,2})?-\[([^\]\s]+)\]")
+STRING = re.compile(r"""'([^'\\\n]*)'|"([^"\\\n]*)"|`([^`\\]*)`""")
+
+
+def die(msg):
+    print(f"brand-lint: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def norm_hex(h):
+    """Return #RRGGBB in upper case; drop an alpha channel."""
+    h = h.lstrip("#")
+    if len(h) in (3, 4):
+        h = "".join(c * 2 for c in h[:3])
+    return "#" + h[:6].upper()
+
+
+def rgb_hex(r, g, b):
+    return "#%02X%02X%02X" % (min(int(r), 255), min(int(g), 255), min(int(b), 255))
+
+
+def hsl_hex(h, s, l):
+    r, g, b = colorsys.hls_to_rgb(float(h) % 360 / 360, float(l) / 100, float(s) / 100)
+    return rgb_hex(round(r * 255), round(g * 255), round(b * 255))
+
+
+def token_hex(key, value):
+    if isinstance(value, dict):
+        value = value.get("value", value.get("hex"))
+    if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{3,8}", value.strip()):
+        die(f"{TOKENS}: {key} must be a hex color such as #172623, not {value!r}")
+    return norm_hex(value.strip())
+
+
+def load_tokens(workspace):
+    path = workspace / TOKENS
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        die(f"{path} is absent; run the brand-builder skill first")
+    except json.JSONDecodeError as e:
+        die(f"{path} is not valid JSON: {e}")
+    if not isinstance(data.get("colors"), dict) or not data["colors"]:
+        die(f"{TOKENS}: colors must map each color name to a hex value")
+    lint = data.get("lint", {})
+    colors = {token_hex(f"colors.{k}", v) for k, v in data["colors"].items()}
+    allow_named = set()
+    for v in lint.get("allow_colors", []):
+        if isinstance(v, str) and v.lower() in NAMED_COLORS:
+            allow_named.add(v.lower())
+        else:
+            colors.add(token_hex("lint.allow_colors", v))
+    allow_named |= {n for n, h in NAMED_HEX.items() if h in colors}
+    fonts = {f.lower() for k, f in data.get("typography", {}).items()
+             if isinstance(f, str) and not k.endswith("_weight")}
+    fonts |= {f.lower() for f in lint.get("allow_fonts", [])}
+    radius = None
+    if isinstance(data.get("corner_radius_px"), (int, float)):
+        r = data["corner_radius_px"]
+        r = int(r) if float(r).is_integer() else r
+        radius = {"0", "0px", f"{r}px"} | CSS_WIDE | set(lint.get("allow_radius", []))
+    names = data.get("names", {})
+    return {
+        "colors": colors,
+        "named": allow_named,
+        "fonts": fonts,
+        "radius": radius,
+        "standard": names.get("standard"),
+        "ascii": names.get("ascii"),
+        "exclude": [glob_re(p) for p in lint.get("exclude", [])],
+    }
+
+
+def glob_re(pattern):
+    """A glob anchored at the workspace root: ** crosses folders, * does not."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"(?:/.*)?\Z")
+
+
+def skipped(rel, tok):
+    parts = rel.split("/")
+    return (any(p in SKIP_DIRS for p in parts[:-1]) or rel.startswith(SKIP_ROOT)
+            or SKIP_FILES.search(rel) or any(r.match(rel) for r in tok["exclude"]))
+
+
+def listing(workspace):
+    """The files of the workspace, by git when it is a repository."""
+    r = subprocess.run(["git", "-C", str(workspace), "ls-files", "-co", "--exclude-standard", "-z"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        return [workspace / p for p in r.stdout.split("\0") if p]
+    return [f for f in workspace.rglob("*") if f.is_file()]
+
+
+def files(paths, workspace, tok):
+    roots = [Path(p).resolve() for p in paths] or [workspace]
+    for root in roots:
+        if root != workspace and workspace not in root.parents:
+            die(f"{root} lies outside the workspace {workspace}")
+    all_files = listing(workspace)
+    for f in sorted(set(all_files)):
+        if not any(f == r or r in f.parents for r in roots) or not f.is_file():
+            continue
+        rel = f.relative_to(workspace).as_posix()
+        if f.suffix.lower() in EXTENSIONS and not skipped(rel, tok):
+            yield f, rel
+
+
+def family_list(text, start):
+    """Read a CSS font family list from text[start:]; yield (offset, name)."""
+    i, n = start, len(text)
+    while i < n:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return
+        if text[i] in "'\"":
+            end = text.find(text[i], i + 1)
+            if end < 0:
+                return
+            yield i, text[i + 1:end]
+            i = end + 1
+        else:
+            m = re.match(r"[A-Za-z0-9_-]+(?:[ \t]+[A-Za-z0-9_-]+)*", text[i:])
+            if not m:
+                return
+            name = m.group(0)
+            if name.lower() == "important" or DYNAMIC.match(text, i):
+                return
+            if text.startswith(("var(", "theme("), i):
+                return
+            yield i, name
+            i += m.end()
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i < n and text[i] == ",":
+            i += 1
+            continue
+        return
+
+
+def js_value_strings(text, start):
+    """The string values that follow a JS key: a string, an array, or an object."""
+    i = start
+    if i >= len(text):
+        return
+    if text[i] in "'\"`":
+        m = STRING.match(text, i)
+        if m:
+            yield i, m.group(m.lastindex)
+        return
+    if text[i] not in "[{":
+        if text[i].isdigit():
+            m = re.match(r"[\d.]+", text[i:])
+            yield i, m.group(0) + "px"
+        return
+    depth, j = 0, i
+    while j < len(text):
+        c = text[j]
+        if c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c in "'\"`":
+            m = STRING.match(text, j)
+            if not m:
+                break
+            if not re.match(r"\s*:", text[m.end():]):
+                yield j, m.group(m.lastindex)
+            j = m.end()
+            continue
+        elif c.isdigit() and text[j - 1] in " :\t":
+            m = re.match(r"[\d.]+", text[j:])
+            yield j, m.group(0) + "px"
+            j += m.end()
+            continue
+        j += 1
+
+
+class Scan:
+    def __init__(self, text, ext, tok):
+        self.text, self.ext, self.tok = text, ext, tok
+        self.starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
+        self.lines = text.split("\n")
+        self.found = {}
+
+    def add(self, pos, rule, msg):
+        n = bisect_right(self.starts, pos) - 1
+        if ALLOW_MARK in self.lines[n]:
+            return
+        self.found.setdefault((n + 1, pos - self.starts[n] + 1, rule, msg), None)
+
+    def line_before(self, pos):
+        return self.text[self.starts[bisect_right(self.starts, pos) - 1]:pos]
+
+    def font(self, pos, name):
+        name = name.strip().strip("'\"` ")
+        if not name or DYNAMIC.search(name):
+            return
+        if name.lower() not in GENERIC_FONTS and name.lower() not in self.tok["fonts"]:
+            self.add(pos, "BL-FONT", f"font {name!r} is not in the typography of the brand")
+
+    def radius(self, pos, value):
+        if self.tok["radius"] is None or DYNAMIC.search(value) or "{" in value:
+            return
+        value = re.sub(r"!\s*important", "", value)
+        for part in dict.fromkeys(value.replace("/", " ").split()):
+            if part not in self.tok["radius"]:
+                self.add(pos, "BL-RADIUS", f"radius {part} is not the corner radius of the brand")
+
+    def colors(self):
+        tok, text = self.tok, self.text
+        style = self.ext in STYLE_EXT
+        for m in HEX.finditer(text):
+            before = self.line_before(m.start())
+            if NOT_COLOR.search(before):
+                continue
+            # "#123" outside a stylesheet is an issue or a pull request.
+            issue = m.group(1).isdigit() and len(m.group(1)) <= 4
+            if not style and (not COLOR_KEY.search(before) or issue):
+                continue
+            if style and SELECTOR.match(text, m.end()):
+                continue
+            if norm_hex(m.group(1)) not in tok["colors"]:
+                self.add(m.start(), "BL-COLOR", f"{m.group(0)} is not in the palette")
+        for rx, conv in ((RGB, rgb_hex), (HSL, hsl_hex)):
+            for m in rx.finditer(text):
+                h = conv(*m.groups())
+                if h not in tok["colors"]:
+                    self.add(m.start(), "BL-COLOR", f"{m.group(0)} ({h}) is not in the palette")
+        if style:
+            for m in NAMED_DECL.finditer(text):
+                name = m.group(1).lower()
+                if name in NAMED_COLORS and name not in tok["named"]:
+                    self.add(m.start(1), "BL-COLOR", f"{m.group(1)} is not in the palette")
+
+    def fonts(self):
+        text = self.text
+        for rx in (FONT_CSS, FONT_SHORT):
+            for m in rx.finditer(text):
+                for pos, name in family_list(text, m.end()):
+                    self.font(pos, name)
+        for m in FONT_ATTR.finditer(text):
+            for pos, name in family_list(m.group(2), 0):
+                self.font(m.start(2) + pos, name)
+        for m in FONT_JS.finditer(text):
+            for pos, value in js_value_strings(text, m.end()):
+                for off, name in family_list(value, 0):
+                    self.font(pos, name)
+        for m in FONT_GOOGLE.finditer(text):
+            for fam in re.findall(r"family=([^&:|]+)", m.group(1).replace("&amp;", "&")):
+                self.font(m.start(), fam.replace("+", " "))
+        for m in FONT_TW.finditer(text):
+            value = m.group(1).replace("_", " ")
+            if not value[0].isdigit():
+                self.font(m.start(), value)
+
+    def radii(self):
+        text = self.text
+        for m in RADIUS_CSS.finditer(text):
+            self.radius(m.start(), m.group(1))
+        for m in RADIUS_JS.finditer(text):
+            for pos, value in js_value_strings(text, m.end()):
+                self.radius(pos, value)
+        for m in RADIUS_TW.finditer(text):
+            self.radius(m.start(), m.group(1).replace("_", " "))
+
+    def name(self):
+        a, s = self.tok["ascii"], self.tok["standard"]
+        if not a or not s or a.lower() == s.lower():
+            return
+        rx = re.compile(r"(?<![\w.@/-])" + r"\s+".join(map(re.escape, a.split())) + r"(?![\w.@/-])", re.I)
+        for m in rx.finditer(self.text):
+            self.add(m.start(), "BL-NAME", f"{m.group(0)!r} in place of {s!r}")
+
+    def run(self):
+        self.colors()
+        self.fonts()
+        self.radii()
+        self.name()
+        return sorted(self.found)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--workspace", required=True)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    workspace = Path(args.workspace).resolve()
+    tok = load_tokens(workspace)
+    findings = []
+    for f, rel in files(args.paths, workspace, tok):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for line, col, rule, msg in Scan(text, f.suffix.lower(), tok).run():
+            findings.append({"path": rel, "line": line, "col": col, "rule": rule, "message": msg})
+    if args.json:
+        print(json.dumps(findings, ensure_ascii=False, indent=2))
+    else:
+        for x in findings:
+            print(f"{x['path']}:{x['line']}:{x['col']} — {x['rule']} — {x['message']}")
+        print(f"{len(findings)} findings", file=sys.stderr)
+    sys.exit(1 if findings else 0)
+
+
+if __name__ == "__main__":
+    main()

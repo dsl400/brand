@@ -1,0 +1,37 @@
+# Publishes the brand-builder and brand-check skills as one GitHub release asset when a v* tag is pushed.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s skills/brand-check/tools -p 'test_*.py'
+      - name: Write the version of the tag into each skill
+        run: |
+          for f in skills/*/SKILL.md; do
+            sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" "$f"
+            grep -q "^  version: ${GITHUB_REF_NAME#v}$" "$f"
+          done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Lint the flows with the latest lnl release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo dsl400/lnl --pattern lnl.mjs
+          for f in skills/*/SKILL.md; do node lnl.mjs lint "$f"; done
+      - name: Pack the skills
+        run: tar -czf brand.tar.gz -C skills --exclude='test_*' --exclude=__pycache__ --exclude=.pytest_cache brand-builder brand-check
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" brand.tar.gz --title "$GITHUB_REF_NAME" --generate-notes
